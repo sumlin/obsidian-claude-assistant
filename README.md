@@ -7,7 +7,7 @@
 ![Obsidian](https://img.shields.io/badge/Obsidian-483699?style=flat&logo=obsidian&logoColor=white)
 ![Claude](https://img.shields.io/badge/Claude-FF6B35?style=flat&logo=anthropic&logoColor=white)
 
-An Obsidian plugin that integrates Claude Code CLI to provide AI assistance directly within your note-taking workflow.
+An Obsidian plugin that integrates Claude Code CLI to provide AI assistance directly within your note-taking workflow. Works on Windows, macOS, and Linux.
 
 ## Features
 
@@ -53,13 +53,33 @@ An Obsidian plugin that integrates Claude Code CLI to provide AI assistance dire
 
 ## Configuration
 
-The plugin automatically detects common Claude CLI installation paths:
+### Settings
+
+The plugin provides several configuration options:
+
+1. **Claude CLI Path**: Path to Claude CLI executable (default: `claude` from PATH)
+2. **Node.js Path**: Path to Node.js executable (default: `node` from PATH)
+3. **Log Directory Path**: Directory for debug logs (default: `~/.config/obsidian-claude-assistant/logs`)
+4. **Execution Timeout**: Timeout for Claude CLI execution in seconds (default: 180)
+
+### Auto-detection
+
+The plugin automatically detects Claude CLI in common installation paths across platforms:
+
+**Windows:**
+- `%APPDATA%\claude\claude.exe`
+- `%LOCALAPPDATA%\claude\claude.exe`
+- `%ProgramFiles%\claude\claude.exe`
+
+**macOS/Linux:**
 - `/usr/local/bin/claude`
+- `/usr/bin/claude`
 - `/opt/homebrew/bin/claude`
 - `~/.claude/local/claude`
-- And more...
+- `~/.config/claude/claude`
+- `~/.local/bin/claude`
 
-You can also manually specify the Claude CLI path in the plugin settings.
+You can also manually specify paths in the plugin settings.
 
 ## Development
 

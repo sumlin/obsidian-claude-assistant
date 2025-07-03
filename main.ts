@@ -1,69 +1,162 @@
 import { Plugin, MarkdownView, Modal, Setting, Notice, App, PluginSettingTab } from 'obsidian';
 import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
-import { access, writeFile, appendFile } from 'fs/promises';
+import { promises as fs } from 'fs';
 import { homedir } from 'os';
-import { join } from 'path';
+import { join, normalize } from 'path';
+import { platform } from 'os';
 
 const execAsync = promisify(exec);
 
 interface ClaudeAssistantSettings {
     claudePath: string;
+    nodePath: string;
+    logPath: string;
+    executionTimeout: number;
 }
 
 const DEFAULT_SETTINGS: ClaudeAssistantSettings = {
-    claudePath: 'claude'
+    claudePath: 'claude',
+    nodePath: 'node',
+    logPath: '~/.config/obsidian-claude-assistant/logs',
+    executionTimeout: 180
+}
+
+// Utility functions for cross-platform path handling
+function expandTilde(filepath: string): string {
+    if (filepath.startsWith('~/')) {
+        return join(homedir(), filepath.slice(2));
+    }
+    return filepath;
+}
+
+function normalizePathForPlatform(filepath: string): string {
+    const expanded = expandTilde(filepath);
+    return normalize(expanded);
+}
+
+async function ensureDirectoryExists(dirPath: string): Promise<void> {
+    const normalizedPath = normalizePathForPlatform(dirPath);
+    try {
+        await fs.access(normalizedPath);
+    } catch {
+        // Directory doesn't exist, create it
+        await fs.mkdir(normalizedPath, { recursive: true });
+    }
 }
 
 export default class ClaudeAssistantPlugin extends Plugin {
     private claudePath: string | null = null;
     settings: ClaudeAssistantSettings;
     private logFilePath: string;
+    private activeProcesses: Set<any> = new Set();
 
     async onload() {
-        await this.loadSettings();
+        try {
+            await this.loadSettings();
+            
+            // Set log file path
+            try {
+                const logDir = normalizePathForPlatform(this.settings.logPath);
+                await ensureDirectoryExists(logDir);
+                this.logFilePath = join(logDir, 'debug.log');
+                await this.log('=== Claude Assistant Plugin Started ===');
+            } catch (logError) {
+                // Log initialization failed, but plugin can still work
+                console.error('Claude Assistant: Failed to initialize logging:', logError);
+                console.log('Claude Assistant: Plugin will continue without file logging');
+            }
         
-        // ログファイルパスを設定
-        this.logFilePath = '/Users/kazuph/Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian Vault/.obsidian/plugins/claude-assistant/debug.log';
-        await this.log('=== Claude Assistant Plugin Started ===');
-        
-        // 設定からパスを使用、なければ自動検出
+        // Use path from settings, if not available - auto detect
         if (this.settings.claudePath && this.settings.claudePath !== 'claude') {
             this.claudePath = this.settings.claudePath;
             console.log('Claude Assistant: Using configured path:', this.claudePath);
         } else {
-            // Claude CLIのパスを初期化時に解決
+            // Resolve Claude CLI path during initialization
             this.claudePath = await this.findClaudePath();
             
-            // デバッグ: パス情報をコンソールに出力
+            // Debug: Output path information to console
             if (this.claudePath) {
                 console.log('Claude Assistant: Found Claude CLI at:', this.claudePath);
             } else {
-                console.warn('Claude Assistant: Claude CLI not found');
+                console.warn('Claude Assistant: Claude CLI not found. Please install it from https://claude.ai/code or specify the path in plugin settings.');
             }
         }
-        // コマンドパレットにコマンドを追加
+        // Add command to command palette
         this.addCommand({
             id: 'ask-claude',
             name: 'Ask Claude about current note',
             callback: () => this.openQuestionModal(),
         });
 
-        // リボンアイコンを追加
+        // Add ribbon icon
         this.addRibbonIcon('message-circle', 'Ask Claude', () => {
             this.openQuestionModal();
         });
 
-        // 設定タブを追加
+        // Add settings tab
         this.addSettingTab(new ClaudeAssistantSettingTab(this.app, this));
+        } catch (error) {
+            console.error('Claude Assistant: Failed to initialize plugin:', error);
+            new Notice('Claude Assistant failed to initialize. Please check console for details.');
+        }
     }
 
     onunload() {
-
+        // Clean up any active processes
+        if (this.activeProcesses.size > 0) {
+            console.log(`Claude Assistant: Cleaning up ${this.activeProcesses.size} active processes`);
+            
+            for (const child of this.activeProcesses) {
+                try {
+                    // Try graceful shutdown first
+                    child.kill('SIGTERM');
+                    
+                    // Force kill after 1 second if still running
+                    setTimeout(() => {
+                        if (!child.killed) {
+                            child.kill('SIGKILL');
+                        }
+                    }, 1000);
+                } catch (error) {
+                    console.error('Claude Assistant: Error killing process:', error);
+                }
+            }
+            
+            this.activeProcesses.clear();
+        }
+        
+        console.log('Claude Assistant: Plugin unloaded');
     }
 
     async loadSettings() {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+        
+        // Migration: ensure new fields exist with defaults if missing
+        let needsSave = false;
+        
+        if (this.settings.nodePath === undefined) {
+            this.settings.nodePath = DEFAULT_SETTINGS.nodePath;
+            needsSave = true;
+            console.log('Claude Assistant: Migrated nodePath setting');
+        }
+        
+        if (this.settings.logPath === undefined) {
+            this.settings.logPath = DEFAULT_SETTINGS.logPath;
+            needsSave = true;
+            console.log('Claude Assistant: Migrated logPath setting');
+        }
+        
+        if (this.settings.executionTimeout === undefined) {
+            this.settings.executionTimeout = DEFAULT_SETTINGS.executionTimeout;
+            needsSave = true;
+            console.log('Claude Assistant: Migrated executionTimeout setting');
+        }
+        
+        if (needsSave) {
+            await this.saveSettings();
+            console.log('Claude Assistant: Settings migration completed');
+        }
     }
 
     async saveSettings() {
@@ -75,7 +168,7 @@ export default class ClaudeAssistantPlugin extends Plugin {
         const logEntry = `[${timestamp}] ${message}\n`;
         
         try {
-            await appendFile(this.logFilePath, logEntry, 'utf8');
+            await fs.appendFile(this.logFilePath, logEntry, 'utf8');
             console.log(`Claude Assistant: ${message}`);
         } catch (error) {
             console.error('Failed to write to log file:', error);
@@ -84,10 +177,10 @@ export default class ClaudeAssistantPlugin extends Plugin {
     }
 
     openQuestionModal() {
-        // アクティブなエディターを取得
+        // Get active editor
         const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
         if (!activeView) {
-            new Notice('No active markdown view found');
+            new Notice('Please open a markdown note before using Claude Assistant');
             return;
         }
 
@@ -95,12 +188,12 @@ export default class ClaudeAssistantPlugin extends Plugin {
         const selectedText = editor.getSelection();
 
         if (selectedText && selectedText.trim()) {
-            // 選択テキストがある場合：即座に実行
+            // If selected text exists: execute immediately
             this.log(`openQuestionModal: Selected text detected (${selectedText.length} chars), executing immediately`);
             this.log(`openQuestionModal: Selected text: "${selectedText.substring(0, 200)}..."`);
             this.processClaudeRequestWithSelection(selectedText);
         } else {
-            // 選択テキストがない場合：従来のモーダル表示
+            // If no selected text: show traditional modal
             this.log('openQuestionModal: No selection found, showing modal');
             new QuestionModal(this.app, async (question: string) => {
                 await this.processClaudeRequest(question);
@@ -114,42 +207,42 @@ export default class ClaudeAssistantPlugin extends Plugin {
         const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
         if (!activeView) {
             await this.log('ERROR: No active markdown view found');
-            new Notice('No active markdown view found');
+            new Notice('Please open a markdown note before using Claude Assistant');
             return;
         }
 
         const activeFile = this.app.workspace.getActiveFile();
         if (!activeFile) {
             await this.log('ERROR: No active file found');
-            new Notice('No active file found');
+            new Notice('Please open a file before using Claude Assistant');
             return;
         }
 
         try {
-            // Loading通知を表示
+            // Show loading notification
             const loadingNotice = new Notice('Asking Claude...', 0);
             await this.log('Loading notice displayed');
             
-            // デバッグ情報
+            // Debug information
             await this.log(`Using Claude path: ${this.claudePath}`);
             
-            // ノート内容を取得
+            // Get note content
             const noteContent = await this.app.vault.read(activeFile);
             await this.log(`Note content length: ${noteContent.length} characters`);
             await this.log(`Note content preview: ${noteContent.substring(0, 200)}...`);
             await this.log(`Selected text as question: "${selectedText}"`);
             
-            // Claudeコマンドを実行（選択テキストを質問として使用）
+            // Execute Claude command (use selected text as question)
             await this.log('Starting Claude command execution...');
             const result = await this.executeClaudeCommand(noteContent, selectedText);
             await this.log(`Claude command completed. Result length: ${result.length} characters`);
             await this.log(`Claude response preview: ${result.substring(0, 300)}...`);
             
-            // Loading通知を削除
+            // Remove loading notification
             loadingNotice.hide();
             await this.log('Loading notice hidden');
             
-            // 選択範囲をClaude応答で置き換え
+            // Replace selection with Claude response
             const editor = activeView.editor;
             editor.replaceSelection(result);
             await this.log('Selected text replaced with Claude response');
@@ -159,7 +252,7 @@ export default class ClaudeAssistantPlugin extends Plugin {
         } catch (error) {
             await this.log(`ERROR in processClaudeRequestWithSelection: ${error.message}`);
             await this.log(`ERROR stack: ${error.stack}`);
-            new Notice(`Error: ${error.message}`);
+            new Notice(`Claude Assistant Error: ${error.message}. Please check the plugin settings and ensure Claude CLI is properly installed.`);
             console.error('Claude Assistant Error:', error);
             console.error('Claude Assistant: Current path was:', this.claudePath);
         }
@@ -171,42 +264,42 @@ export default class ClaudeAssistantPlugin extends Plugin {
         const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
         if (!activeView) {
             await this.log('ERROR: No active markdown view found');
-            new Notice('No active markdown view found');
+            new Notice('Please open a markdown note before using Claude Assistant');
             return;
         }
 
         const activeFile = this.app.workspace.getActiveFile();
         if (!activeFile) {
             await this.log('ERROR: No active file found');
-            new Notice('No active file found');
+            new Notice('Please open a file before using Claude Assistant');
             return;
         }
 
         try {
-            // Loading通知を表示
+            // Show loading notification
             const loadingNotice = new Notice('Asking Claude...', 0);
             await this.log('Loading notice displayed');
             
-            // デバッグ情報
+            // Debug information
             await this.log(`Using Claude path: ${this.claudePath}`);
             
-            // ノート内容を取得
+            // Get note content
             const noteContent = await this.app.vault.read(activeFile);
             await this.log(`Note content length: ${noteContent.length} characters`);
             await this.log(`Note content preview: ${noteContent.substring(0, 200)}...`);
             await this.log(`User question: "${question}"`);
             
-            // Claudeコマンドを実行
+            // Execute Claude command
             await this.log('Starting Claude command execution...');
             const result = await this.executeClaudeCommand(noteContent, question);
             await this.log(`Claude command completed. Result length: ${result.length} characters`);
             await this.log(`Claude response preview: ${result.substring(0, 300)}...`);
             
-            // Loading通知を削除
+            // Remove loading notification
             loadingNotice.hide();
             await this.log('Loading notice hidden');
             
-            // カーソル位置に結果を挿入
+            // Insert result at cursor position
             const editor = activeView.editor;
             const cursor = editor.getCursor();
             editor.replaceRange('\n\n' + result + '\n\n', cursor);
@@ -217,7 +310,7 @@ export default class ClaudeAssistantPlugin extends Plugin {
         } catch (error) {
             await this.log(`ERROR in processClaudeRequest: ${error.message}`);
             await this.log(`ERROR stack: ${error.stack}`);
-            new Notice(`Error: ${error.message}`);
+            new Notice(`Claude Assistant Error: ${error.message}. Please check the plugin settings and ensure Claude CLI is properly installed.`);
             console.error('Claude Assistant Error:', error);
             console.error('Claude Assistant: Current path was:', this.claudePath);
         }
@@ -225,16 +318,31 @@ export default class ClaudeAssistantPlugin extends Plugin {
 
     async findClaudePath(): Promise<string | null> {
         const homeDir = homedir();
-        const possiblePaths = [
-            // よくあるClaude CLIのパス（権限問題を回避するため簡素化）
-            'claude', // PATH上のclaude（最も権限問題が少ない）
-            '/usr/local/bin/claude',
-            '/opt/homebrew/bin/claude',
-            `${homeDir}/.claude/local/claude`,
-            `${homeDir}/.claude/local/node_modules/.bin/claude`,
-            `${homeDir}/.config/claude/claude`,
-            `${homeDir}/.local/bin/claude`
-        ];
+        const isWindows = platform() === 'win32';
+        
+        const possiblePaths: string[] = ['claude']; // claude in PATH
+        
+        if (isWindows) {
+            // Windows-specific paths
+            possiblePaths.push(
+                join(process.env.APPDATA || '', 'claude', 'claude.exe'),
+                join(process.env.LOCALAPPDATA || '', 'claude', 'claude.exe'),
+                join(process.env.ProgramFiles || '', 'claude', 'claude.exe'),
+                join(homeDir, '.claude', 'claude.exe'),
+                join(homeDir, 'AppData', 'Local', 'claude', 'claude.exe')
+            );
+        } else {
+            // Unix-like paths (macOS, Linux)
+            possiblePaths.push(
+                '/usr/local/bin/claude',
+                '/usr/bin/claude',
+                '/opt/homebrew/bin/claude',
+                join(homeDir, '.claude', 'local', 'claude'),
+                join(homeDir, '.claude', 'local', 'node_modules', '.bin', 'claude'),
+                join(homeDir, '.config', 'claude', 'claude'),
+                join(homeDir, '.local', 'bin', 'claude')
+            );
+        }
 
         console.log('Claude Assistant: Searching for Claude CLI...');
 
@@ -243,24 +351,25 @@ export default class ClaudeAssistantPlugin extends Plugin {
                 console.log(`Claude Assistant: Checking path: ${path}`);
                 
                 if (path === 'claude') {
-                    // PATH上のコマンドを確認
+                    // Check command in PATH
                     try {
-                        const { stdout } = await execAsync('which claude');
-                        const resolvedPath = stdout.trim();
+                        const searchCommand = isWindows ? 'where' : 'which';
+                        const { stdout } = await execAsync(`${searchCommand} claude`);
+                        const resolvedPath = stdout.trim().split('\n')[0]; // Windows may return multiple paths
                         if (resolvedPath) {
-                            console.log(`Claude Assistant: Found via which: ${resolvedPath}`);
-                            // 実際の実行テスト
+                            console.log(`Claude Assistant: Found via ${searchCommand}: ${resolvedPath}`);
+                            // Actual execution test
                             await this.testClaudePath(resolvedPath);
                             return resolvedPath;
                         }
                     } catch (error) {
-                        console.log(`Claude Assistant: which claude failed: ${error.message}`);
+                        console.log(`Claude Assistant: ${isWindows ? 'where' : 'which'} claude failed: ${error.message}`);
                     }
                 } else {
-                    // ファイルの存在確認
-                    await access(path);
+                    // Check file existence
+                    await fs.access(path);
                     console.log(`Claude Assistant: File exists: ${path}`);
-                    // 実際の実行テスト
+                    // Actual execution test
                     await this.testClaudePath(path);
                     return path;
                 }
@@ -304,58 +413,83 @@ export default class ClaudeAssistantPlugin extends Plugin {
     async executeClaudeCommand(noteContent: string, question: string): Promise<string> {
         await this.log('executeClaudeCommand: Starting execution');
         
-        // プロンプトを構築
+        // Construct prompt
         const prompt = `${noteContent}\n\n---------\n\n${question}`;
         await this.log(`executeClaudeCommand: Prompt length: ${prompt.length} characters`);
         await this.log(`executeClaudeCommand: Prompt preview: ${prompt.substring(0, 200)}...`);
         
-        // 環境変数を適切に設定（Shell commands プラグインの方式）
+        // Set environment variables appropriately
         const processEnv = {
-            ...process.env,
-            // Node.jsのPATHを明示的に追加
-            PATH: [
-                '/opt/homebrew/bin',
-                '/usr/local/bin', 
-                '/Users/kazuph/.local/share/mise/installs/node/20.18.2/bin',
-                process.env.PATH
-            ].filter(Boolean).join(':')
+            ...process.env
         };
-        await this.log(`executeClaudeCommand: Environment PATH: ${processEnv.PATH}`);
         
-        // Claude CLIの実行
-        const claudeCliPath = '/Users/kazuph/.claude/local/node_modules/@anthropic-ai/claude-code/cli.js';
-        const nodeCommand = '/opt/homebrew/bin/node';
-        const args = [claudeCliPath, '--verbose', '--print'];
+        // Execute Claude CLI
+        const claudeCommand = this.claudePath || this.settings.claudePath || 'claude';
+        const nodeCommand = this.settings.nodePath || 'node';
         
-        await this.log(`executeClaudeCommand: Command: ${nodeCommand}`);
-        await this.log(`executeClaudeCommand: Args: [${args[0]}, ${args[1]}, ${args[2] ? 'prompt(' + args[2].length + 'chars)' : 'MISSING_PROMPT'}]`);
+        // Determine if we need to use Node.js to run the command
+        let finalCommand: string;
+        let args: string[];
+        
+        if (claudeCommand.endsWith('.js')) {
+            // JavaScript file, use Node.js
+            finalCommand = nodeCommand;
+            args = [claudeCommand, '--verbose', '--print'];
+        } else {
+            // Assume it's an executable
+            finalCommand = claudeCommand;
+            args = ['--verbose', '--print'];
+        }
+        
+        await this.log(`executeClaudeCommand: Command: ${finalCommand}`);
+        await this.log(`executeClaudeCommand: Args: ${JSON.stringify(args)}`);
         await this.log(`executeClaudeCommand: Working directory: ${homedir()}`);
         
         return new Promise(async (resolve, reject) => {
             await this.log('executeClaudeCommand: Creating spawn process...');
             
-            // Shell commands プラグインと同じ方式でspawn
-            const child = spawn(nodeCommand, args, {
+            let statusInterval: NodeJS.Timeout | null = null;
+            let timeout: NodeJS.Timeout | null = null;
+            
+            // Cleanup function
+            const cleanup = () => {
+                if (statusInterval) {
+                    clearInterval(statusInterval);
+                    statusInterval = null;
+                }
+                if (timeout) {
+                    clearTimeout(timeout);
+                    timeout = null;
+                }
+            };
+            
+            // Spawn using the same method as Shell commands plugin
+            const child = spawn(finalCommand, args, {
                 stdio: ['pipe', 'pipe', 'pipe'],
                 env: processEnv,
-                cwd: homedir() // working directory を明示的に設定
+                cwd: homedir() // Explicitly set working directory
             });
 
             await this.log(`executeClaudeCommand: Spawn created, PID: ${child.pid}`);
+            
+            // Track active process
+            this.activeProcesses.add(child);
 
             let stdout = '';
             let stderr = '';
 
-            // utf8エンコーディングを設定（Shell commands プラグインと同じ）
+            // Set utf8 encoding (same as Shell commands plugin)
             child.stdout?.setEncoding('utf8');
             child.stderr?.setEncoding('utf8');
 
-            // イベントハンドラーを先に全て設定
+            // Set all event handlers first
             child.on('spawn', async () => {
                 await this.log('executeClaudeCommand: Process spawned successfully');
             });
 
             child.on('error', async (error) => {
+                cleanup(); // Clean up intervals and timeouts
+                this.activeProcesses.delete(child); // Remove from active processes
                 await this.log(`executeClaudeCommand: Process error: ${error.message}`);
                 await this.log(`executeClaudeCommand: Error stack: ${error.stack}`);
                 reject(new Error(`Claude CLI execution error: ${error.message}`));
@@ -376,6 +510,8 @@ export default class ClaudeAssistantPlugin extends Plugin {
             });
 
             child.on('close', async (code) => {
+                cleanup(); // Clean up intervals and timeouts
+                this.activeProcesses.delete(child); // Remove from active processes
                 await this.log(`executeClaudeCommand: Process closed with code: ${code}`);
                 await this.log(`executeClaudeCommand: Final stdout length: ${stdout.length}`);
                 await this.log(`executeClaudeCommand: Final stderr length: ${stderr.length}`);
@@ -389,20 +525,12 @@ export default class ClaudeAssistantPlugin extends Plugin {
                 }
             });
 
-            // デバッグ用：定期的な状態チェック
-            const statusInterval = setInterval(async () => {
+            // For debugging: periodic status check
+            statusInterval = setInterval(async () => {
                 await this.log(`executeClaudeCommand: Status check - Process exists: ${child.pid}, killed: ${child.killed}, connected: ${child.connected}`);
             }, 5000);
 
-            child.on('close', () => {
-                clearInterval(statusInterval);
-            });
-
-            child.on('error', () => {
-                clearInterval(statusInterval);
-            });
-
-            // プロンプトを標準入力に送信
+            // Send prompt to standard input
             if (child.stdin) {
                 await this.log('executeClaudeCommand: Writing prompt to stdin...');
                 child.stdin.write(prompt);
@@ -414,12 +542,14 @@ export default class ClaudeAssistantPlugin extends Plugin {
                 return;
             }
 
-            // タイムアウトを無効化（デバッグ用）
-            // setTimeout(() => {
-            //     child.kill('SIGTERM');
-            //     setTimeout(() => child.kill('SIGKILL'), 1000);
-            //     reject(new Error('Claude CLI execution timed out'));
-            // }, 30000);
+            // Timeout setting
+            const timeoutMs = this.settings.executionTimeout * 1000;
+            timeout = setTimeout(() => {
+                child.kill('SIGTERM');
+                setTimeout(() => child.kill('SIGKILL'), 1000);
+                cleanup();
+                reject(new Error(`Claude CLI execution timed out after ${this.settings.executionTimeout} seconds. You can increase the timeout in plugin settings.`));
+            }, timeoutMs);
             
             await this.log('executeClaudeCommand: Promise setup complete, waiting for process...');
         });
@@ -449,7 +579,7 @@ class QuestionModal extends Modal {
                     .onChange(value => this.question = value);
                 text.inputEl.rows = 4;
                 text.inputEl.cols = 50;
-                // フォーカスを設定
+                // Set focus
                 setTimeout(() => text.inputEl.focus(), 100);
             });
 
@@ -471,7 +601,7 @@ class QuestionModal extends Modal {
                     }
                 }));
 
-        // Enterキーでの送信をサポート
+        // Support submission with Enter key
         this.scope.register(['Mod'], 'Enter', (evt: KeyboardEvent) => {
             if (this.question.trim()) {
                 this.close();
@@ -514,31 +644,156 @@ class ClaudeAssistantSettingTab extends PluginSettingTab {
                 }));
 
         new Setting(containerEl)
+            .setName('Node.js Path')
+            .setDesc('Path to Node.js executable (use "node" for system PATH)')
+            .addText(text => text
+                .setPlaceholder('node')
+                .setValue(this.plugin.settings.nodePath)
+                .onChange(async (value) => {
+                    this.plugin.settings.nodePath = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Log Directory Path')
+            .setDesc('Directory for debug logs')
+            .addText(text => text
+                .setPlaceholder('~/.config/obsidian-claude-assistant/logs')
+                .setValue(this.plugin.settings.logPath)
+                .onChange(async (value) => {
+                    this.plugin.settings.logPath = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Execution Timeout')
+            .setDesc('Timeout for Claude CLI execution in seconds')
+            .addText(text => text
+                .setPlaceholder('180')
+                .setValue(String(this.plugin.settings.executionTimeout))
+                .onChange(async (value) => {
+                    const timeout = parseInt(value, 10);
+                    if (!isNaN(timeout) && timeout >= 10) {
+                        this.plugin.settings.executionTimeout = timeout;
+                        await this.plugin.saveSettings();
+                    }
+                }));
+
+        new Setting(containerEl)
             .setName('Test Claude CLI')
             .setDesc('Test if Claude CLI is accessible using the same method as actual execution')
             .addButton(button => button
                 .setButtonText('Test Connection')
                 .onClick(async () => {
                     button.setButtonText('Testing...');
+                    
+                    const testResults = {
+                        claudeCLI: { passed: false, message: '', error: null as any },
+                        logDirectory: { passed: false, message: '', error: null as any },
+                        nodejs: { passed: false, message: '', error: null as any }
+                    };
+                    
+                    // Test 1: Claude CLI
                     try {
-                        // 実際の実行と同じロジックでテスト
-                        const testResult = await this.testClaudeExecution();
-                        new Notice(`✅ Claude CLI test success! Response: ${testResult.substring(0, 100)}${testResult.length > 100 ? '...' : ''}`, 8000);
-                        console.log('Claude CLI test result:', testResult);
-                        button.setButtonText('Test Connection');
+                        button.setButtonText('Testing Claude CLI...');
+                        const claudeResult = await this.testClaudeExecution();
+                        testResults.claudeCLI.passed = true;
+                        testResults.claudeCLI.message = 'Working ✓';
+                        console.log('Claude Assistant: Claude CLI test passed');
                     } catch (error) {
-                        new Notice(`❌ Claude CLI test failed: ${error.message}`, 5000);
-                        console.error('Claude CLI test error:', error);
-                        button.setButtonText('Test Connection');
+                        testResults.claudeCLI.passed = false;
+                        testResults.claudeCLI.message = `Failed: ${error.message}`;
+                        testResults.claudeCLI.error = error;
+                        console.error('Claude Assistant: Claude CLI test failed:', error);
                     }
+                    
+                    // Test 2: Log Directory
+                    try {
+                        button.setButtonText('Testing log directory...');
+                        const logDir = normalizePathForPlatform(this.plugin.settings.logPath);
+                        
+                        // First, try to create the directory if it doesn't exist
+                        try {
+                            await ensureDirectoryExists(logDir);
+                            console.log('Claude Assistant: Log directory created/verified');
+                        } catch (createError) {
+                            console.error('Claude Assistant: Failed to create log directory:', createError);
+                            throw new Error(`Cannot create directory: ${createError.message}`);
+                        }
+                        
+                        // Then verify it exists and is accessible
+                        try {
+                            await fs.access(logDir, fs.constants.W_OK);
+                            testResults.logDirectory.passed = true;
+                            testResults.logDirectory.message = `${logDir} ✓`;
+                            console.log('Claude Assistant: Log directory test passed');
+                        } catch (accessError) {
+                            throw new Error(`Directory exists but not writable: ${accessError.message}`);
+                        }
+                    } catch (error) {
+                        testResults.logDirectory.passed = false;
+                        testResults.logDirectory.message = `Failed: ${error.message}`;
+                        testResults.logDirectory.error = error;
+                        console.error('Claude Assistant: Log directory test failed:', error);
+                    }
+                    
+                    // Test 3: Node.js
+                    try {
+                        button.setButtonText('Testing Node.js...');
+                        const nodeTest = await this.testCommand(this.plugin.settings.nodePath || 'node', ['--version']);
+                        testResults.nodejs.passed = true;
+                        testResults.nodejs.message = `${nodeTest.trim()} ✓`;
+                        console.log('Claude Assistant: Node.js test passed');
+                    } catch (error) {
+                        testResults.nodejs.passed = false;
+                        testResults.nodejs.message = `Failed: ${error.message}`;
+                        testResults.nodejs.error = error;
+                        console.error('Claude Assistant: Node.js test failed:', error);
+                    }
+                    
+                    // Display results
+                    const allPassed = testResults.claudeCLI.passed && 
+                                    testResults.logDirectory.passed && 
+                                    testResults.nodejs.passed;
+                    
+                    if (allPassed) {
+                        new Notice(`✅ All tests passed!\n` +
+                                 `Claude CLI: ${testResults.claudeCLI.message}\n` +
+                                 `Log directory: ${testResults.logDirectory.message}\n` +
+                                 `Node.js: ${testResults.nodejs.message}`, 8000);
+                    } else {
+                        let failedTests = [];
+                        let detailedErrors = [];
+                        
+                        if (!testResults.claudeCLI.passed) {
+                            failedTests.push('Claude CLI');
+                            detailedErrors.push(`Claude CLI: ${testResults.claudeCLI.message}`);
+                        }
+                        if (!testResults.logDirectory.passed) {
+                            failedTests.push('Log Directory');
+                            detailedErrors.push(`Log Directory: ${testResults.logDirectory.message}`);
+                        }
+                        if (!testResults.nodejs.passed) {
+                            failedTests.push('Node.js');
+                            detailedErrors.push(`Node.js: ${testResults.nodejs.message}`);
+                        }
+                        
+                        new Notice(`❌ Some tests failed:\n\n` +
+                                 `✓ Passed: ${3 - failedTests.length} / 3\n` +
+                                 `✗ Failed: ${failedTests.join(', ')}\n\n` +
+                                 `Details:\n${detailedErrors.join('\n')}\n\n` +
+                                 `Please check the failed components`, 15000);
+                    }
+                    
+                    button.setButtonText('Test Connection');
                 }));
 
-        // デバッグ用テスト機能（必要最小限）
+        // Debug test functionality (minimal necessary)
         containerEl.createEl('h3', { text: 'Debug Commands' });
         
         const debugCommands = [
-            { name: 'Test Node.js access', command: '/opt/homebrew/bin/node', args: ['--version'] },
-            { name: 'Test Claude CLI direct', command: '/opt/homebrew/bin/node', args: ['/Users/kazuph/.claude/local/node_modules/@anthropic-ai/claude-code/cli.js', '--version'] }
+            { name: 'Test Node.js access', command: this.plugin.settings.nodePath || 'node', args: ['--version'] },
+            { name: 'Test Claude CLI direct', command: this.plugin.settings.claudePath || 'claude', args: ['--version'] }
         ];
 
         debugCommands.forEach(cmd => {
@@ -561,7 +816,7 @@ class ClaudeAssistantSettingTab extends PluginSettingTab {
                     }))
         });
 
-        // macOS権限についての説明
+        // Explanation about macOS permissions
         containerEl.createEl('h3', { text: 'macOS Permissions' });
         containerEl.createEl('p', { 
             text: 'If Claude CLI is not found, you may need to grant Obsidian additional permissions:'
@@ -579,11 +834,11 @@ class ClaudeAssistantSettingTab extends PluginSettingTab {
     async testClaudeExecution(): Promise<string> {
         await this.plugin.log('testClaudeExecution: Starting test with actual prompt');
         
-        const testPrompt = 'こんにちは';
+        const testPrompt = 'Hello';
         await this.plugin.log(`testClaudeExecution: Test input: "${testPrompt}"`);
         
         try {
-            // 実際のexecuteClaudeCommandを使用してテスト
+            // Test using actual executeClaudeCommand
             const result = await this.plugin.executeClaudeCommand('', testPrompt);
             await this.plugin.log(`testClaudeExecution: Test output: "${result}"`);
             await this.plugin.log('testClaudeExecution: Test completed successfully');
@@ -615,7 +870,7 @@ class ClaudeAssistantSettingTab extends PluginSettingTab {
 
             child.on('close', (code) => {
                 if (code === 0) {
-                    resolve(stdout || stderr); // stderrも正常出力として扱う場合がある
+                    resolve(stdout || stderr); // stderr may also be treated as normal output
                 } else {
                     reject(new Error(`Command failed with exit code ${code}: ${stderr || stdout}`));
                 }

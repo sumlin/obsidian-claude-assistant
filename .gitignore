@@ -28,3 +28,7 @@ yarn-error.log*
 
 # Plugin specific
 data.json
+
+tmp/
+
+main.js
